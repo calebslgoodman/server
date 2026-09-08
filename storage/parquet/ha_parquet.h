@@ -30,6 +30,7 @@ public:
   int delete_row(const uchar *buf) override;
   int rnd_init(bool scan) override;
   int rnd_next(uchar *buf) override;
+  int rnd_end() override;
   int rnd_pos(uchar *buf, uchar *pos) override;
   void position(const uchar *record) override;
   int info(uint flag) override;
@@ -45,7 +46,10 @@ private:
   THR_LOCK_DATA lock;
   std::string parquet_file_path;
 
-  //not wired up until predicate pushdown lands (stage 2)
+  //per-handler connection into the shared in-memory duckdb instance
+  std::unique_ptr<duckdb::Connection> con;
+  std::string duckdb_table_name;
+
   std::unique_ptr<duckdb::MaterializedQueryResult> scan_result;
   size_t current_row = 0;
 };

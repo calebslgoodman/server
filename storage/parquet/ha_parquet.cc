@@ -2,11 +2,17 @@
 #include <mysql/plugin.h>
 #include "ha_parquet.h"
 #include "sql_class.h"
+#include "field.h"
+#include "parquet_schema.h"
 
 handlerton *parquet_hton;
 
 //one lock shared by every parquet table until day 9's real locking work
 static THR_LOCK parquet_lock;
+
+//one in-memory duckdb database backs every parquet table until day 4
+//swaps this for real parquet files. each handler gets its own connection.
+static duckdb::DuckDB *parquet_db;
 
 static handler *parquet_create_handler(handlerton *hton, TABLE_SHARE *table,
                                        MEM_ROOT *mem_root)
@@ -19,6 +25,7 @@ static int parquet_init_func(void *p)
   parquet_hton= (handlerton *)p;
   parquet_hton->create= parquet_create_handler;
   thr_lock_init(&parquet_lock);
+  parquet_db= new duckdb::DuckDB(nullptr);
   return 0;
 }
 
@@ -40,28 +47,80 @@ ulong ha_parquet::index_flags(uint idx, uint part, bool all_parts) const
 int ha_parquet::open(const char *name, int mode, uint test_if_locked)
 {
   thr_lock_data_init(&parquet_lock, &lock, NULL);
+  duckdb_table_name= name;
+  con.reset(new duckdb::Connection(*parquet_db));
   return 0;
 }
 
 int ha_parquet::close(void)
 {
+  scan_result.reset();
+  con.reset();
   return 0;
 }
 
 int ha_parquet::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *create_info)
 {
-  //no real data path yet (day 2 goal is just that CREATE TABLE succeeds)
+  std::string sql, error;
+  if (!parquet::BuildDuckDBCreateTableSql(name, table_arg, &sql, &error))
+    return HA_ERR_UNSUPPORTED;
+
+  try
+  {
+    duckdb::Connection ddl_con(*parquet_db);
+    auto result= ddl_con.Query(sql);
+    if (result->HasError())
+      return HA_ERR_INTERNAL_ERROR;
+  }
+  catch (const std::exception &e)
+  {
+    return HA_ERR_INTERNAL_ERROR;
+  }
   return 0;
 }
 
 int ha_parquet::delete_table(const char *name)
 {
+  try
+  {
+    duckdb::Connection ddl_con(*parquet_db);
+    ddl_con.Query("DROP TABLE IF EXISTS " + parquet::QuoteIdentifier(name));
+  }
+  catch (const std::exception &e)
+  {
+    return HA_ERR_INTERNAL_ERROR;
+  }
   return 0;
 }
 
 int ha_parquet::write_row(const uchar *buf)
 {
-  return HA_ERR_WRONG_COMMAND;
+  std::string error;
+  MY_BITMAP *org_bitmap= dbug_tmp_use_all_columns(table, &table->read_set);
+
+  try
+  {
+    duckdb::Appender appender(*con, duckdb_table_name);
+    appender.BeginRow();
+    for (Field **field= table->field; *field; field++)
+    {
+      if (!parquet::AppendMariaDBFieldToDuckDBAppender(*field, &appender, &error))
+      {
+        dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
+        return HA_ERR_UNSUPPORTED;
+      }
+    }
+    appender.EndRow();
+    appender.Close();
+  }
+  catch (const std::exception &e)
+  {
+    dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
+  return 0;
 }
 
 int ha_parquet::update_row(const uchar *old_data, const uchar *new_data)
@@ -76,12 +135,57 @@ int ha_parquet::delete_row(const uchar *buf)
 
 int ha_parquet::rnd_init(bool scan)
 {
-  return HA_ERR_WRONG_COMMAND;
+  try
+  {
+    scan_result= con->Query("SELECT * FROM " + parquet::QuoteIdentifier(duckdb_table_name));
+    if (scan_result->HasError())
+      return HA_ERR_INTERNAL_ERROR;
+  }
+  catch (const std::exception &e)
+  {
+    return HA_ERR_INTERNAL_ERROR;
+  }
+  current_row= 0;
+  return 0;
 }
 
 int ha_parquet::rnd_next(uchar *buf)
 {
-  return HA_ERR_WRONG_COMMAND;
+  if (!scan_result || current_row >= scan_result->RowCount())
+    return HA_ERR_END_OF_FILE;
+
+  std::string error;
+  MY_BITMAP *org_bitmap= dbug_tmp_use_all_columns(table, &table->write_set);
+  uint col= 0;
+
+  try
+  {
+    for (Field **field= table->field; *field; field++, col++)
+    {
+      duckdb::Value value= scan_result->GetValue(col, current_row);
+      if (!parquet::StoreDuckDBValueInMariaDBField(*field, value, &error))
+      {
+        dbug_tmp_restore_column_map(&table->write_set, org_bitmap);
+        return HA_ERR_UNSUPPORTED;
+      }
+    }
+  }
+  catch (const std::exception &e)
+  {
+    dbug_tmp_restore_column_map(&table->write_set, org_bitmap);
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  dbug_tmp_restore_column_map(&table->write_set, org_bitmap);
+  current_row++;
+  return 0;
+}
+
+int ha_parquet::rnd_end()
+{
+  scan_result.reset();
+  current_row= 0;
+  return 0;
 }
 
 int ha_parquet::rnd_pos(uchar *buf, uchar *pos)

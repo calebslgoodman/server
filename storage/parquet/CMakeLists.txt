@@ -9,6 +9,7 @@ ENDIF()
 
 MYSQL_ADD_PLUGIN(parquet
   ha_parquet.cc
+  parquet_schema.cc
   STORAGE_ENGINE
 )
 
