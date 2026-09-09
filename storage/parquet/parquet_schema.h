@@ -6,6 +6,7 @@
 #include "duckdb.hpp"
 
 #include <string>
+#include <vector>
 
 class Field;
 struct TABLE;
@@ -15,6 +16,16 @@ namespace parquet
 {
 
 std::string QuoteIdentifier(const std::string &identifier);
+
+//builds a duckdb list literal, e.g. ['a', 'b'], quoting/escaping each value.
+std::string BuildDuckDBStringList(const std::vector<std::string> &values);
+
+//builds "read_parquet([...])" over the given file paths.
+std::string BuildDuckDBReadParquetSql(const std::vector<std::string> &paths);
+
+//builds "COPY <table_or_query> TO '<path>' (FORMAT PARQUET)".
+std::string BuildDuckDBCopyToParquetSql(const std::string &table_or_query,
+                                        const std::string &path);
 
 //maps a mariadb column to the duckdb type used to store it. returns
 //false and fills *error if the field's type isn't supported yet.

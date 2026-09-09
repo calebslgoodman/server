@@ -5,14 +5,29 @@
 #include "field.h"
 #include "parquet_schema.h"
 
+#include <sys/stat.h>
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <vector>
+
 handlerton *parquet_hton;
 
 //one lock shared by every parquet table until day 9's real locking work
 static THR_LOCK parquet_lock;
 
-//one in-memory duckdb database backs every parquet table until day 4
-//swaps this for real parquet files. each handler gets its own connection.
+//write_row buffers into an in-memory duckdb table (per open table name);
+//external_lock's unlock flushes that buffer out to a real .parquet file
+//on disk and remembers its path here so rnd_init can read it back.
 static duckdb::DuckDB *parquet_db;
+static std::mutex parquet_files_mutex;
+static std::map<std::string, std::vector<std::string>> parquet_files;
+static std::map<std::string, uint64_t> parquet_file_counter;
+
+static std::string ParquetFileDir(const std::string &table_path)
+{
+  return table_path + "_parquet";
+}
 
 static handler *parquet_create_handler(handlerton *hton, TABLE_SHARE *table,
                                        MEM_ROOT *mem_root)
@@ -65,6 +80,9 @@ int ha_parquet::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
   if (!parquet::BuildDuckDBCreateTableSql(name, table_arg, &sql, &error))
     return HA_ERR_UNSUPPORTED;
 
+  if (mkdir(ParquetFileDir(name).c_str(), 0777) != 0 && errno != EEXIST)
+    return HA_ERR_INTERNAL_ERROR;
+
   try
   {
     duckdb::Connection ddl_con(*parquet_db);
@@ -76,6 +94,10 @@ int ha_parquet::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
   {
     return HA_ERR_INTERNAL_ERROR;
   }
+
+  std::lock_guard<std::mutex> guard(parquet_files_mutex);
+  parquet_files[name].clear();
+  parquet_file_counter[name]= 0;
   return 0;
 }
 
@@ -90,6 +112,13 @@ int ha_parquet::delete_table(const char *name)
   {
     return HA_ERR_INTERNAL_ERROR;
   }
+
+  std::lock_guard<std::mutex> guard(parquet_files_mutex);
+  for (const auto &f : parquet_files[name])
+    std::remove(f.c_str());
+  parquet_files.erase(name);
+  parquet_file_counter.erase(name);
+  rmdir(ParquetFileDir(name).c_str());
   return 0;
 }
 
@@ -135,9 +164,17 @@ int ha_parquet::delete_row(const uchar *buf)
 
 int ha_parquet::rnd_init(bool scan)
 {
+  std::string sql= "SELECT * FROM " + parquet::QuoteIdentifier(duckdb_table_name);
+  {
+    std::lock_guard<std::mutex> guard(parquet_files_mutex);
+    const auto &files= parquet_files[duckdb_table_name];
+    if (!files.empty())
+      sql+= " UNION ALL SELECT * FROM " + parquet::BuildDuckDBReadParquetSql(files);
+  }
+
   try
   {
-    scan_result= con->Query("SELECT * FROM " + parquet::QuoteIdentifier(duckdb_table_name));
+    scan_result= con->Query(sql);
     if (scan_result->HasError())
       return HA_ERR_INTERNAL_ERROR;
   }
@@ -203,6 +240,43 @@ int ha_parquet::info(uint flag)
 
 int ha_parquet::external_lock(THD *thd, int lock_type)
 {
+  //flush the write buffer to a real parquet file once mariadb is done
+  //with this table for the statement (see extra_docs/MariaDB Locks
+  //Info.docx: "for unlock, export remaining row data as parquet file")
+  if (lock_type != F_UNLCK)
+    return 0;
+
+  try
+  {
+    auto count_result= con->Query(
+        "SELECT COUNT(*) FROM " + parquet::QuoteIdentifier(duckdb_table_name));
+    if (count_result->HasError())
+      return HA_ERR_INTERNAL_ERROR;
+    if (count_result->GetValue<int64_t>(0, 0) == 0)
+      return 0;
+
+    std::string file_path;
+    {
+      std::lock_guard<std::mutex> guard(parquet_files_mutex);
+      file_path= ParquetFileDir(duckdb_table_name) + "/data_" +
+                 std::to_string(parquet_file_counter[duckdb_table_name]++) +
+                 ".parquet";
+    }
+
+    auto copy_result= con->Query(parquet::BuildDuckDBCopyToParquetSql(
+        parquet::QuoteIdentifier(duckdb_table_name), file_path));
+    if (copy_result->HasError())
+      return HA_ERR_INTERNAL_ERROR;
+
+    con->Query("DELETE FROM " + parquet::QuoteIdentifier(duckdb_table_name));
+
+    std::lock_guard<std::mutex> guard(parquet_files_mutex);
+    parquet_files[duckdb_table_name].push_back(file_path);
+  }
+  catch (const std::exception &e)
+  {
+    return HA_ERR_INTERNAL_ERROR;
+  }
   return 0;
 }
 

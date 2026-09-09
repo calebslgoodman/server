@@ -18,6 +18,44 @@ std::string QuoteIdentifier(const std::string &identifier)
   return quoted;
 }
 
+static std::string QuoteStringLiteral(const std::string &value)
+{
+  std::string quoted= "'";
+  for (char c : value)
+  {
+    if (c == '\'')
+      quoted+= '\'';
+    quoted+= c;
+  }
+  quoted+= '\'';
+  return quoted;
+}
+
+std::string BuildDuckDBStringList(const std::vector<std::string> &values)
+{
+  std::string list= "[";
+  for (size_t i= 0; i < values.size(); i++)
+  {
+    if (i > 0)
+      list+= ", ";
+    list+= QuoteStringLiteral(values[i]);
+  }
+  list+= "]";
+  return list;
+}
+
+std::string BuildDuckDBReadParquetSql(const std::vector<std::string> &paths)
+{
+  return "read_parquet(" + BuildDuckDBStringList(paths) + ")";
+}
+
+std::string BuildDuckDBCopyToParquetSql(const std::string &table_or_query,
+                                        const std::string &path)
+{
+  return "COPY " + table_or_query + " TO " + QuoteStringLiteral(path) +
+         " (FORMAT PARQUET)";
+}
+
 bool MariaDBFieldToDuckDBType(Field *field, std::string *duckdb_type, std::string *error)
 {
   switch (field->type())
