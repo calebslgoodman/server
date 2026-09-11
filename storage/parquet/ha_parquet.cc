@@ -3,9 +3,12 @@
 #include "ha_parquet.h"
 #include "sql_class.h"
 #include "field.h"
+#include "log.h"
 #include "parquet_schema.h"
+#include "parquet_object_store.h"
 
 #include <sys/stat.h>
+#include <chrono>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -18,15 +21,33 @@ static THR_LOCK parquet_lock;
 
 //write_row buffers into an in-memory duckdb table (per open table name);
 //external_lock's unlock flushes that buffer out to a real .parquet file
-//on disk and remembers its path here so rnd_init can read it back.
+//(and, if configured, uploads it to s3) once it's held enough rows or
+//gone stale for long enough. flushed file paths are remembered here so
+//rnd_init can read them back.
 static duckdb::DuckDB *parquet_db;
 static std::mutex parquet_files_mutex;
 static std::map<std::string, std::vector<std::string>> parquet_files;
 static std::map<std::string, uint64_t> parquet_file_counter;
+static std::map<std::string, uint64_t> parquet_buffered_rows;
+static std::map<std::string, std::chrono::steady_clock::time_point> parquet_last_flush;
+
+static char *parquet_s3_endpoint;
+static char *parquet_s3_bucket;
+static char *parquet_s3_region;
+static char *parquet_s3_access_key;
+static char *parquet_s3_secret_key;
+static unsigned long parquet_write_buffer_max_rows;
+static unsigned long parquet_write_buffer_flush_interval_ms;
 
 static std::string ParquetFileDir(const std::string &table_path)
 {
   return table_path + "_parquet";
+}
+
+static parquet::ObjectStoreConfig CurrentS3Config()
+{
+  return {parquet_s3_endpoint, parquet_s3_bucket, parquet_s3_region,
+          parquet_s3_access_key, parquet_s3_secret_key};
 }
 
 static handler *parquet_create_handler(handlerton *hton, TABLE_SHARE *table,
@@ -98,6 +119,8 @@ int ha_parquet::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
   std::lock_guard<std::mutex> guard(parquet_files_mutex);
   parquet_files[name].clear();
   parquet_file_counter[name]= 0;
+  parquet_buffered_rows[name]= 0;
+  parquet_last_flush[name]= std::chrono::steady_clock::now();
   return 0;
 }
 
@@ -118,6 +141,8 @@ int ha_parquet::delete_table(const char *name)
     std::remove(f.c_str());
   parquet_files.erase(name);
   parquet_file_counter.erase(name);
+  parquet_buffered_rows.erase(name);
+  parquet_last_flush.erase(name);
   rmdir(ParquetFileDir(name).c_str());
   return 0;
 }
@@ -149,6 +174,9 @@ int ha_parquet::write_row(const uchar *buf)
   }
 
   dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
+
+  std::lock_guard<std::mutex> guard(parquet_files_mutex);
+  parquet_buffered_rows[duckdb_table_name]++;
   return 0;
 }
 
@@ -240,19 +268,30 @@ int ha_parquet::info(uint flag)
 
 int ha_parquet::external_lock(THD *thd, int lock_type)
 {
-  //flush the write buffer to a real parquet file once mariadb is done
-  //with this table for the statement (see extra_docs/MariaDB Locks
-  //Info.docx: "for unlock, export remaining row data as parquet file")
+  //mariadb calls this to release the table at the end of a statement (see
+  //extra_docs/MariaDB Locks Info.docx). that's our hook to check whether
+  //the write buffer has earned a flush yet -- not every unlock flushes,
+  //only once row-count or staleness thresholds are crossed (day 5;
+  //day 3/4 flushed unconditionally on every unlock instead).
   if (lock_type != F_UNLCK)
     return 0;
 
   try
   {
-    auto count_result= con->Query(
-        "SELECT COUNT(*) FROM " + parquet::QuoteIdentifier(duckdb_table_name));
-    if (count_result->HasError())
-      return HA_ERR_INTERNAL_ERROR;
-    if (count_result->GetValue<int64_t>(0, 0) == 0)
+    bool should_flush;
+    {
+      std::lock_guard<std::mutex> guard(parquet_files_mutex);
+      uint64_t rows= parquet_buffered_rows[duckdb_table_name];
+      if (rows == 0)
+        return 0;
+      auto elapsed= std::chrono::steady_clock::now() -
+                    parquet_last_flush[duckdb_table_name];
+      auto elapsed_ms=
+          std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+      should_flush= rows >= parquet_write_buffer_max_rows ||
+                    elapsed_ms >= (int64_t)parquet_write_buffer_flush_interval_ms;
+    }
+    if (!should_flush)
       return 0;
 
     std::string file_path;
@@ -270,8 +309,24 @@ int ha_parquet::external_lock(THD *thd, int lock_type)
 
     con->Query("DELETE FROM " + parquet::QuoteIdentifier(duckdb_table_name));
 
+    parquet::ObjectStoreConfig s3_config= CurrentS3Config();
+    if (s3_config.enabled())
+    {
+      std::string upload_error;
+      if (!parquet::UploadFileToS3(file_path, file_path, s3_config, &upload_error))
+      {
+        //local file is still valid and still tracked below -- staying
+        //local-only on a failed upload beats losing the write entirely.
+        //real retry/alerting is day 9 hardening work.
+        sql_print_warning("parquet: s3 upload of %s failed: %s",
+                          file_path.c_str(), upload_error.c_str());
+      }
+    }
+
     std::lock_guard<std::mutex> guard(parquet_files_mutex);
     parquet_files[duckdb_table_name].push_back(file_path);
+    parquet_buffered_rows[duckdb_table_name]= 0;
+    parquet_last_flush[duckdb_table_name]= std::chrono::steady_clock::now();
   }
   catch (const std::exception &e)
   {
@@ -299,6 +354,55 @@ const Item *ha_parquet::cond_push(const Item *cond)
 void ha_parquet::cond_pop()
 {}
 
+static MYSQL_SYSVAR_STR(s3_endpoint, parquet_s3_endpoint,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+  "S3-compatible endpoint (e.g. http://127.0.0.1:9000 for a local minio). "
+  "Empty disables S3 upload; flushed files stay local-only.",
+  NULL, NULL, "");
+
+static MYSQL_SYSVAR_STR(s3_bucket, parquet_s3_bucket,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+  "S3 bucket that flushed parquet files get uploaded to.",
+  NULL, NULL, "");
+
+static MYSQL_SYSVAR_STR(s3_region, parquet_s3_region,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+  "S3 region used for sigv4 request signing.",
+  NULL, NULL, "us-east-1");
+
+static MYSQL_SYSVAR_STR(s3_access_key, parquet_s3_access_key,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+  "S3 access key id.",
+  NULL, NULL, "");
+
+static MYSQL_SYSVAR_STR(s3_secret_key, parquet_s3_secret_key,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+  "S3 secret access key.",
+  NULL, NULL, "");
+
+static MYSQL_SYSVAR_ULONG(write_buffer_max_rows, parquet_write_buffer_max_rows,
+  PLUGIN_VAR_RQCMDARG,
+  "Flush a table's write buffer to a parquet file once it holds this many rows.",
+  NULL, NULL, 100000, 1, ULONG_MAX, 1);
+
+static MYSQL_SYSVAR_ULONG(write_buffer_flush_interval_ms,
+  parquet_write_buffer_flush_interval_ms, PLUGIN_VAR_RQCMDARG,
+  "Flush a table's write buffer if it has held rows for at least this "
+  "many milliseconds, even below the row-count threshold.",
+  NULL, NULL, 30000, 100, ULONG_MAX, 1);
+
+static struct st_mysql_sys_var *parquet_system_variables[]=
+{
+  MYSQL_SYSVAR(s3_endpoint),
+  MYSQL_SYSVAR(s3_bucket),
+  MYSQL_SYSVAR(s3_region),
+  MYSQL_SYSVAR(s3_access_key),
+  MYSQL_SYSVAR(s3_secret_key),
+  MYSQL_SYSVAR(write_buffer_max_rows),
+  MYSQL_SYSVAR(write_buffer_flush_interval_ms),
+  NULL
+};
+
 struct st_mysql_storage_engine parquet_storage_engine=
 { MYSQL_HANDLERTON_INTERFACE_VERSION };
 
@@ -314,7 +418,7 @@ maria_declare_plugin(parquet)
   NULL,
   0x0001,
   NULL,
-  NULL,
+  parquet_system_variables,
   "0.1",
   MariaDB_PLUGIN_MATURITY_EXPERIMENTAL
 }

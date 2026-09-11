@@ -1,5 +1,7 @@
 #parquet build config
 
+FIND_PACKAGE(CURL REQUIRED)
+
 IF(NOT TARGET libduckdb)
   MESSAGE(FATAL_ERROR
     "Parquet storage engine requires DuckDB target 'libduckdb'. "
@@ -10,6 +12,7 @@ ENDIF()
 MYSQL_ADD_PLUGIN(parquet
   ha_parquet.cc
   parquet_schema.cc
+  parquet_object_store.cc
   STORAGE_ENGINE
 )
 
@@ -20,5 +23,6 @@ IF(TARGET parquet)
   )
   target_link_libraries(parquet
     libduckdb
+    CURL::libcurl
   )
 ENDIF()
