@@ -97,6 +97,7 @@ bool BuildDuckDBCreateTableSql(const std::string &table_name, TABLE *table,
       columns+= ", ";
     columns+= QuoteIdentifier((*field)->field_name.str) + " " + duckdb_type;
   }
+  columns+= ", " PARQUET_TXN_ID_COLUMN " BIGINT";
   *sql= "CREATE TABLE IF NOT EXISTS " + QuoteIdentifier(table_name) +
         " (" + columns + ")";
   return true;

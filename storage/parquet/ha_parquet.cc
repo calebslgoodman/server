@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 handlerton *parquet_hton;
@@ -19,11 +20,13 @@ handlerton *parquet_hton;
 //one lock shared by every parquet table until day 9's real locking work
 static THR_LOCK parquet_lock;
 
-//write_row buffers into an in-memory duckdb table (per open table name);
-//external_lock's unlock flushes that buffer out to a real .parquet file
-//(and, if configured, uploads it to s3) once it's held enough rows or
-//gone stale for long enough. flushed file paths are remembered here so
-//rnd_init can read them back.
+//write_row buffers into an in-memory duckdb table (per open table name).
+//parquet_commit flushes that buffer out to a real .parquet file (and, if
+//configured, uploads it to s3) once it's held enough rows or gone stale
+//for long enough -- but only once mariadb confirms the statement that
+//wrote those rows actually succeeded. parquet_rollback discards just
+//that statement's rows otherwise. flushed file paths are remembered
+//here so rnd_init can read them back.
 static duckdb::DuckDB *parquet_db;
 static std::mutex parquet_files_mutex;
 static std::map<std::string, std::vector<std::string>> parquet_files;
@@ -39,6 +42,20 @@ static char *parquet_s3_secret_key;
 static unsigned long parquet_write_buffer_max_rows;
 static unsigned long parquet_write_buffer_flush_interval_ms;
 
+//per-thd "mailbox" (see extra_docs/MariaDB System Design.docx) tracking
+//which tables this statement/transaction wrote to, so the handlerton
+//commit/rollback hooks -- which only get a THD*, not a handler -- know
+//what to flush or clean up. stage 1 scope: trans_register_ha is always
+//called with all=false (statement-level only, matching Ayush's team's
+//own staging), so an explicit multi-statement BEGIN...ROLLBACK can't
+//undo earlier statements in the same transaction that already
+//committed -- only the statement currently in flight. real
+//transaction-level (all=true) atomicity is stage 3/2pc territory.
+struct ParquetTxnState
+{
+  std::set<std::string> tables;
+};
+
 static std::string ParquetFileDir(const std::string &table_path)
 {
   return table_path + "_parquet";
@@ -48,6 +65,122 @@ static parquet::ObjectStoreConfig CurrentS3Config()
 {
   return {parquet_s3_endpoint, parquet_s3_bucket, parquet_s3_region,
           parquet_s3_access_key, parquet_s3_secret_key};
+}
+
+//flushes table_name's write buffer to a new local parquet file (and
+//uploads it to s3, if configured) if it has crossed the row-count or
+//staleness threshold. no-op otherwise. called from parquet_commit once
+//mariadb confirms the writing statement succeeded.
+static void FlushIfThresholdMet(const std::string &table_name)
+{
+  try
+  {
+    bool should_flush;
+    {
+      std::lock_guard<std::mutex> guard(parquet_files_mutex);
+      uint64_t rows= parquet_buffered_rows[table_name];
+      if (rows == 0)
+        return;
+      auto elapsed= std::chrono::steady_clock::now() - parquet_last_flush[table_name];
+      auto elapsed_ms=
+          std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+      should_flush= rows >= parquet_write_buffer_max_rows ||
+                    elapsed_ms >= (int64_t)parquet_write_buffer_flush_interval_ms;
+    }
+    if (!should_flush)
+      return;
+
+    std::string file_path;
+    {
+      std::lock_guard<std::mutex> guard(parquet_files_mutex);
+      file_path= ParquetFileDir(table_name) + "/data_" +
+                 std::to_string(parquet_file_counter[table_name]++) + ".parquet";
+    }
+
+    duckdb::Connection flush_con(*parquet_db);
+    std::string real_columns= "(SELECT * EXCLUDE (" PARQUET_TXN_ID_COLUMN ") FROM " +
+                              parquet::QuoteIdentifier(table_name) + ")";
+    auto copy_result=
+        flush_con.Query(parquet::BuildDuckDBCopyToParquetSql(real_columns, file_path));
+    if (copy_result->HasError())
+    {
+      sql_print_warning("parquet: flush of %s failed: %s", table_name.c_str(),
+                        copy_result->GetError().c_str());
+      return;
+    }
+
+    flush_con.Query("DELETE FROM " + parquet::QuoteIdentifier(table_name));
+
+    parquet::ObjectStoreConfig s3_config= CurrentS3Config();
+    if (s3_config.enabled())
+    {
+      std::string upload_error;
+      if (!parquet::UploadFileToS3(file_path, file_path, s3_config, &upload_error))
+      {
+        //local file is still valid and still tracked below -- staying
+        //local-only on a failed upload beats losing the write entirely.
+        //real retry/alerting is day 9 hardening work.
+        sql_print_warning("parquet: s3 upload of %s failed: %s",
+                          file_path.c_str(), upload_error.c_str());
+      }
+    }
+
+    std::lock_guard<std::mutex> guard(parquet_files_mutex);
+    parquet_files[table_name].push_back(file_path);
+    parquet_buffered_rows[table_name]= 0;
+    parquet_last_flush[table_name]= std::chrono::steady_clock::now();
+  }
+  catch (const std::exception &e)
+  {
+    sql_print_warning("parquet: flush of %s failed: %s", table_name.c_str(), e.what());
+  }
+}
+
+static int parquet_commit(THD *thd, bool all)
+{
+  ParquetTxnState *txn= (ParquetTxnState *)thd_get_ha_data(thd, parquet_hton);
+  if (!txn)
+    return 0;
+
+  for (const auto &table_name : txn->tables)
+    FlushIfThresholdMet(table_name);
+
+  delete txn;
+  thd_set_ha_data(thd, parquet_hton, NULL);
+  return 0;
+}
+
+static int parquet_rollback(THD *thd, bool all)
+{
+  ParquetTxnState *txn= (ParquetTxnState *)thd_get_ha_data(thd, parquet_hton);
+  if (!txn)
+    return 0;
+
+  for (const auto &table_name : txn->tables)
+  {
+    try
+    {
+      duckdb::Connection rollback_con(*parquet_db);
+      rollback_con.Query("DELETE FROM " + parquet::QuoteIdentifier(table_name) +
+                         " WHERE " PARQUET_TXN_ID_COLUMN " = " +
+                         std::to_string((int64_t)thd->query_id));
+
+      auto count_result=
+          rollback_con.Query("SELECT COUNT(*) FROM " + parquet::QuoteIdentifier(table_name));
+      std::lock_guard<std::mutex> guard(parquet_files_mutex);
+      if (!count_result->HasError())
+        parquet_buffered_rows[table_name]= count_result->GetValue<int64_t>(0, 0);
+    }
+    catch (const std::exception &e)
+    {
+      sql_print_warning("parquet: rollback cleanup of %s failed: %s",
+                        table_name.c_str(), e.what());
+    }
+  }
+
+  delete txn;
+  thd_set_ha_data(thd, parquet_hton, NULL);
+  return 0;
 }
 
 static handler *parquet_create_handler(handlerton *hton, TABLE_SHARE *table,
@@ -60,6 +193,8 @@ static int parquet_init_func(void *p)
 {
   parquet_hton= (handlerton *)p;
   parquet_hton->create= parquet_create_handler;
+  parquet_hton->commit= parquet_commit;
+  parquet_hton->rollback= parquet_rollback;
   thr_lock_init(&parquet_lock);
   parquet_db= new duckdb::DuckDB(nullptr);
   return 0;
@@ -164,6 +299,7 @@ int ha_parquet::write_row(const uchar *buf)
         return HA_ERR_UNSUPPORTED;
       }
     }
+    appender.Append<int64_t>((int64_t)ha_thd()->query_id);
     appender.EndRow();
     appender.Close();
   }
@@ -192,7 +328,8 @@ int ha_parquet::delete_row(const uchar *buf)
 
 int ha_parquet::rnd_init(bool scan)
 {
-  std::string sql= "SELECT * FROM " + parquet::QuoteIdentifier(duckdb_table_name);
+  std::string sql= "SELECT * EXCLUDE (" PARQUET_TXN_ID_COLUMN ") FROM " +
+                    parquet::QuoteIdentifier(duckdb_table_name);
   {
     std::lock_guard<std::mutex> guard(parquet_files_mutex);
     const auto &files= parquet_files[duckdb_table_name];
@@ -268,70 +405,26 @@ int ha_parquet::info(uint flag)
 
 int ha_parquet::external_lock(THD *thd, int lock_type)
 {
-  //mariadb calls this to release the table at the end of a statement (see
-  //extra_docs/MariaDB Locks Info.docx). that's our hook to check whether
-  //the write buffer has earned a flush yet -- not every unlock flushes,
-  //only once row-count or staleness thresholds are crossed (day 5;
-  //day 3/4 flushed unconditionally on every unlock instead).
-  if (lock_type != F_UNLCK)
+  //day 4/5 used to flush from here on unlock -- but unlock fires whether
+  //the statement succeeded or failed, so a statement that errored out
+  //partway would still get its rows written to a parquet file as if it
+  //had succeeded. real commit/rollback (parquet_commit/parquet_rollback
+  //below) only fire on the outcome mariadb actually reached, so flushing
+  //moved there. this hook now just registers with the transaction
+  //coordinator and records that duckdb_table_name was touched, so those
+  //hooks -- which only get a THD*, not a handler -- know what to do.
+  if (lock_type == F_UNLCK)
     return 0;
 
-  try
+  trans_register_ha(thd, false, parquet_hton, 0);
+
+  ParquetTxnState *txn= (ParquetTxnState *)thd_get_ha_data(thd, parquet_hton);
+  if (!txn)
   {
-    bool should_flush;
-    {
-      std::lock_guard<std::mutex> guard(parquet_files_mutex);
-      uint64_t rows= parquet_buffered_rows[duckdb_table_name];
-      if (rows == 0)
-        return 0;
-      auto elapsed= std::chrono::steady_clock::now() -
-                    parquet_last_flush[duckdb_table_name];
-      auto elapsed_ms=
-          std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-      should_flush= rows >= parquet_write_buffer_max_rows ||
-                    elapsed_ms >= (int64_t)parquet_write_buffer_flush_interval_ms;
-    }
-    if (!should_flush)
-      return 0;
-
-    std::string file_path;
-    {
-      std::lock_guard<std::mutex> guard(parquet_files_mutex);
-      file_path= ParquetFileDir(duckdb_table_name) + "/data_" +
-                 std::to_string(parquet_file_counter[duckdb_table_name]++) +
-                 ".parquet";
-    }
-
-    auto copy_result= con->Query(parquet::BuildDuckDBCopyToParquetSql(
-        parquet::QuoteIdentifier(duckdb_table_name), file_path));
-    if (copy_result->HasError())
-      return HA_ERR_INTERNAL_ERROR;
-
-    con->Query("DELETE FROM " + parquet::QuoteIdentifier(duckdb_table_name));
-
-    parquet::ObjectStoreConfig s3_config= CurrentS3Config();
-    if (s3_config.enabled())
-    {
-      std::string upload_error;
-      if (!parquet::UploadFileToS3(file_path, file_path, s3_config, &upload_error))
-      {
-        //local file is still valid and still tracked below -- staying
-        //local-only on a failed upload beats losing the write entirely.
-        //real retry/alerting is day 9 hardening work.
-        sql_print_warning("parquet: s3 upload of %s failed: %s",
-                          file_path.c_str(), upload_error.c_str());
-      }
-    }
-
-    std::lock_guard<std::mutex> guard(parquet_files_mutex);
-    parquet_files[duckdb_table_name].push_back(file_path);
-    parquet_buffered_rows[duckdb_table_name]= 0;
-    parquet_last_flush[duckdb_table_name]= std::chrono::steady_clock::now();
+    txn= new ParquetTxnState();
+    thd_set_ha_data(thd, parquet_hton, txn);
   }
-  catch (const std::exception &e)
-  {
-    return HA_ERR_INTERNAL_ERROR;
-  }
+  txn->tables.insert(duckdb_table_name);
   return 0;
 }
 

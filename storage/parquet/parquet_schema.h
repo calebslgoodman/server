@@ -12,6 +12,12 @@ class Field;
 struct TABLE;
 typedef unsigned char uchar;
 
+//hidden column on the duckdb write buffer holding the mariadb statement
+//(THD::query_id) that inserted each row, so a rollback can delete just
+//that statement's rows without touching other buffered data. excluded
+//from every read/flush via "SELECT * EXCLUDE (PARQUET_TXN_ID_COLUMN)".
+#define PARQUET_TXN_ID_COLUMN "_parquet_txn_id"
+
 namespace parquet
 {
 
