@@ -84,6 +84,30 @@ std::string UrlEncode(const std::string &value)
   return result;
 }
 
+//create-table and load-table responses share the same shape:
+//{"metadata-location": "...", "metadata": {...}}. pull out what a
+//commit needs to know about the table's current state.
+bool ParseLoadTableResult(const std::string &body, CatalogLoadTableResult *result)
+{
+  nlohmann::json parsed= nlohmann::json::parse(body, nullptr, false);
+  if (parsed.is_discarded() || !parsed.contains("metadata-location") ||
+      !parsed.contains("metadata"))
+    return false;
+
+  result->metadata_location= parsed["metadata-location"].get<std::string>();
+  const nlohmann::json &metadata= parsed["metadata"];
+  result->raw_metadata_json= metadata.dump();
+  result->table_uuid= metadata.value("table-uuid", "");
+  result->current_schema_id= metadata.value("current-schema-id", 0);
+  result->last_sequence_number= metadata.value("last-sequence-number", 0ULL);
+  //fresh tables have no snapshot at all yet -- stays empty in that case.
+  if (metadata.contains("current-snapshot-id") &&
+      !metadata["current-snapshot-id"].is_null())
+    result->current_snapshot_id=
+        std::to_string(metadata["current-snapshot-id"].get<int64_t>());
+  return true;
+}
+
 } // namespace
 
 std::string EncodeNamespaceForUrlPath(const CatalogNamespaceIdent &ident,
@@ -211,15 +235,71 @@ CatalogStatus ParquetCatalogClient::CreateTable(const CatalogCreateTableRequest 
     return status;
   }
 
-  nlohmann::json parsed= nlohmann::json::parse(response.body, nullptr, false);
-  if (parsed.is_discarded() || !parsed.contains("metadata-location"))
+  if (!ParseLoadTableResult(response.body, result))
   {
     status.code= CatalogStatusCode::kInvalidResponse;
-    status.message= "create table response had no metadata-location";
+    status.message= "create table response was not a valid load-table result";
     return status;
   }
-  result->metadata_location= parsed["metadata-location"].get<std::string>();
-  result->raw_response_json= response.body;
+  return status;
+}
+
+CatalogStatus ParquetCatalogClient::LoadTable(const CatalogTableIdent &ident,
+                                              CatalogLoadTableResult *result)
+{
+  CatalogStatus status;
+  std::string namespace_path=
+      EncodeNamespaceForUrlPath(ident.namespace_ident, namespace_separator_);
+  std::string url= config_.base_uri + "/v1/" + UrlEncode(prefix_) + "/namespaces/" +
+                   namespace_path + "/tables/" + UrlEncode(ident.table_name);
+  HttpResponse response= DoRequest(url, "GET", "", config_);
+
+  if (response.status != 200)
+  {
+    status.code= response.status == 404 ? CatalogStatusCode::kInvalidResponse
+                                        : CatalogStatusCode::kServerError;
+    status.http_status= response.status;
+    status.message= "GET .../tables/{table} failed: " + response.body;
+    return status;
+  }
+  if (!ParseLoadTableResult(response.body, result))
+  {
+    status.code= CatalogStatusCode::kInvalidResponse;
+    status.message= "load table response was not a valid load-table result";
+  }
+  return status;
+}
+
+CatalogStatus ParquetCatalogClient::CommitTable(const CatalogCommitRequest &request,
+                                                CatalogLoadTableResult *result)
+{
+  CatalogStatus status;
+  std::string namespace_path= EncodeNamespaceForUrlPath(
+      request.ident.namespace_ident, namespace_separator_);
+  std::string url= config_.base_uri + "/v1/" + UrlEncode(prefix_) + "/namespaces/" +
+                   namespace_path + "/tables/" + UrlEncode(request.ident.table_name);
+  HttpResponse response=
+      DoRequest(url, "POST", request.commit_request_json, config_);
+
+  if (response.status == 409)
+  {
+    status.code= CatalogStatusCode::kConflict;
+    status.http_status= response.status;
+    status.message= "commit lost the optimistic-concurrency race: " + response.body;
+    return status;
+  }
+  if (response.status != 200)
+  {
+    status.code= CatalogStatusCode::kServerError;
+    status.http_status= response.status;
+    status.message= "POST .../tables/{table} (commit) failed: " + response.body;
+    return status;
+  }
+  if (!ParseLoadTableResult(response.body, result))
+  {
+    status.code= CatalogStatusCode::kInvalidResponse;
+    status.message= "commit response was not a valid load-table result";
+  }
   return status;
 }
 

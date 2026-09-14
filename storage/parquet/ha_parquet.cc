@@ -7,6 +7,7 @@
 #include "parquet_schema.h"
 #include "parquet_object_store.h"
 #include "parquet_catalog.h"
+#include "parquet_iceberg.h"
 
 #include <sys/stat.h>
 #include <chrono>
@@ -30,7 +31,7 @@ static THR_LOCK parquet_lock;
 //here so rnd_init can read them back.
 static duckdb::DuckDB *parquet_db;
 static std::mutex parquet_files_mutex;
-static std::map<std::string, std::vector<std::string>> parquet_files;
+static std::map<std::string, std::vector<parquet::CatalogDataFile>> parquet_files;
 static std::map<std::string, uint64_t> parquet_file_counter;
 static std::map<std::string, uint64_t> parquet_buffered_rows;
 static std::map<std::string, std::chrono::steady_clock::time_point> parquet_last_flush;
@@ -145,6 +146,84 @@ static parquet::ObjectStoreConfig CurrentS3Config()
           parquet_s3_access_key, parquet_s3_secret_key};
 }
 
+//commits new_file into table_name's iceberg table as a new snapshot:
+//loads the table's current state from the catalog, builds a manifest +
+//manifest-list covering the previously-committed files (from
+//parquet_files, which does not yet include new_file at this point --
+//see the call site) plus new_file, uploads those two avro files to s3
+//next to the data file, then commits. on success, fills in new_file's
+//added_in_snapshot_id/added_in_sequence_number so a later commit that
+//rewrites the manifest again encodes this file correctly as "existing".
+static bool CommitFlushedFileToIceberg(const std::string &table_name,
+                                       parquet::CatalogDataFile *new_file,
+                                       std::string *error)
+{
+  std::string db_name, table_ident;
+  if (!SplitTableIdent(table_name, &db_name, &table_ident))
+  {
+    *error= "could not derive a namespace/table name from '" + table_name + "'";
+    return false;
+  }
+
+  parquet::CatalogClientConfig cat_config;
+  cat_config.base_uri= parquet_catalog_base_uri;
+  cat_config.warehouse= parquet_catalog_warehouse;
+  parquet::ParquetCatalogClient catalog(cat_config);
+
+  parquet::CatalogStatus status= catalog.BootstrapConfig();
+  if (!status.ok())
+  {
+    *error= "catalog bootstrap failed: " + status.message;
+    return false;
+  }
+
+  parquet::CatalogTableIdent ident;
+  ident.namespace_ident.parts= {db_name};
+  ident.table_name= table_ident;
+
+  parquet::CatalogLoadTableResult load_result;
+  status= catalog.LoadTable(ident, &load_result);
+  if (!status.ok())
+  {
+    *error= "LoadTable failed: " + status.message;
+    return false;
+  }
+
+  std::vector<parquet::CatalogDataFile> existing_files;
+  {
+    std::lock_guard<std::mutex> guard(parquet_files_mutex);
+    existing_files= parquet_files[table_name];
+  }
+
+  parquet::IcebergCommitArtifacts artifacts;
+  if (!parquet::BuildIcebergCommitArtifacts(ident, load_result, existing_files, *new_file,
+                                            parquet_s3_bucket, ParquetFileDir(table_name),
+                                            &artifacts, error))
+    return false;
+
+  parquet::ObjectStoreConfig s3_config= CurrentS3Config();
+  if (!parquet::UploadFileToS3(artifacts.manifest_local_path, artifacts.manifest_key,
+                               s3_config, error) ||
+      !parquet::UploadFileToS3(artifacts.manifest_list_local_path,
+                               artifacts.manifest_list_key, s3_config, error))
+    return false;
+
+  parquet::CatalogCommitRequest commit_request;
+  commit_request.ident= ident;
+  commit_request.commit_request_json= artifacts.commit_request_json;
+  parquet::CatalogLoadTableResult commit_result;
+  status= catalog.CommitTable(commit_request, &commit_result);
+  if (!status.ok())
+  {
+    *error= "CommitTable failed: " + status.message;
+    return false;
+  }
+
+  new_file->added_in_snapshot_id= artifacts.snapshot_id;
+  new_file->added_in_sequence_number= artifacts.sequence_number;
+  return true;
+}
+
 //flushes table_name's write buffer to a new local parquet file (and
 //uploads it to s3, if configured) if it has crossed the row-count or
 //staleness threshold. no-op otherwise. called from parquet_commit once
@@ -154,9 +233,10 @@ static void FlushIfThresholdMet(const std::string &table_name)
   try
   {
     bool should_flush;
+    uint64_t rows;
     {
       std::lock_guard<std::mutex> guard(parquet_files_mutex);
-      uint64_t rows= parquet_buffered_rows[table_name];
+      rows= parquet_buffered_rows[table_name];
       if (rows == 0)
         return;
       auto elapsed= std::chrono::steady_clock::now() - parquet_last_flush[table_name];
@@ -189,6 +269,14 @@ static void FlushIfThresholdMet(const std::string &table_name)
 
     flush_con.Query("DELETE FROM " + parquet::QuoteIdentifier(table_name));
 
+    struct stat file_stat;
+    parquet::CatalogDataFile new_file;
+    new_file.path= file_path;
+    new_file.record_count= rows;
+    new_file.file_size_bytes= stat(file_path.c_str(), &file_stat) == 0
+                                  ? (uint64_t)file_stat.st_size
+                                  : 0;
+
     parquet::ObjectStoreConfig s3_config= CurrentS3Config();
     if (s3_config.enabled())
     {
@@ -203,8 +291,21 @@ static void FlushIfThresholdMet(const std::string &table_name)
       }
     }
 
+    //day 8: commit this file into the iceberg table as a new snapshot,
+    //if a catalog is configured. needs s3 too -- the manifest/
+    //manifest-list have to point at real s3:// locations, and there's
+    //no catalog-configured-but-no-s3 case worth supporting.
+    if (parquet_catalog_base_uri[0] != '\0' && parquet_catalog_warehouse[0] != '\0' &&
+        s3_config.enabled())
+    {
+      std::string commit_error;
+      if (!CommitFlushedFileToIceberg(table_name, &new_file, &commit_error))
+        sql_print_warning("parquet: iceberg commit for %s failed: %s",
+                          file_path.c_str(), commit_error.c_str());
+    }
+
     std::lock_guard<std::mutex> guard(parquet_files_mutex);
-    parquet_files[table_name].push_back(file_path);
+    parquet_files[table_name].push_back(new_file);
     parquet_buffered_rows[table_name]= 0;
     parquet_last_flush[table_name]= std::chrono::steady_clock::now();
   }
@@ -362,7 +463,7 @@ int ha_parquet::delete_table(const char *name)
 
   std::lock_guard<std::mutex> guard(parquet_files_mutex);
   for (const auto &f : parquet_files[name])
-    std::remove(f.c_str());
+    std::remove(f.path.c_str());
   parquet_files.erase(name);
   parquet_file_counter.erase(name);
   parquet_buffered_rows.erase(name);
@@ -423,7 +524,12 @@ int ha_parquet::rnd_init(bool scan)
     std::lock_guard<std::mutex> guard(parquet_files_mutex);
     const auto &files= parquet_files[duckdb_table_name];
     if (!files.empty())
-      sql+= " UNION ALL SELECT * FROM " + parquet::BuildDuckDBReadParquetSql(files);
+    {
+      std::vector<std::string> paths;
+      for (const auto &f : files)
+        paths.push_back(f.path);
+      sql+= " UNION ALL SELECT * FROM " + parquet::BuildDuckDBReadParquetSql(paths);
+    }
   }
 
   try

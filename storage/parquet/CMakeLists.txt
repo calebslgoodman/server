@@ -14,6 +14,7 @@ MYSQL_ADD_PLUGIN(parquet
   parquet_schema.cc
   parquet_object_store.cc
   parquet_catalog.cc
+  parquet_iceberg.cc
   STORAGE_ENGINE
 )
 

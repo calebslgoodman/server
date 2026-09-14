@@ -1,6 +1,7 @@
 #ifndef PARQUET_CATALOG_INCLUDED
 #define PARQUET_CATALOG_INCLUDED
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -56,7 +57,38 @@ struct CatalogCreateTableRequest
 struct CatalogLoadTableResult
 {
   std::string metadata_location;
-  std::string raw_response_json;
+  std::string raw_metadata_json;
+
+  //pulled out of raw_metadata_json for convenience -- everything a
+  //commit needs to know about the table's current state.
+  std::string table_uuid;
+  std::string current_snapshot_id; //empty if the table has no snapshot yet
+  int current_schema_id= 0;
+  uint64_t last_sequence_number= 0;
+};
+
+//one already-committed data file this table's current snapshot points
+//at (used to rebuild the manifest fully on every commit -- see
+//parquet_iceberg.h).
+struct CatalogDataFile
+{
+  std::string path;
+  uint64_t record_count= 0;
+  uint64_t file_size_bytes= 0;
+  //the snapshot this file was originally added in, and its sequence
+  //number at that time -- needed to encode it correctly as an
+  //"existing" (status=0) entry when a later commit rewrites the
+  //manifest to include it again.
+  uint64_t added_in_snapshot_id= 0;
+  uint64_t added_in_sequence_number= 0;
+};
+
+struct CatalogCommitRequest
+{
+  CatalogTableIdent ident;
+  //full iceberg rest "commit table" body: {"requirements": [...],
+  //"updates": [...]}, built by parquet_iceberg.h's BuildCommitRequestJson.
+  std::string commit_request_json;
 };
 
 //joins namespace parts with the given separator, url-encoding each part
@@ -77,6 +109,17 @@ public:
   CatalogStatus EnsureNamespace(const CatalogNamespaceIdent &ident);
 
   CatalogStatus CreateTable(const CatalogCreateTableRequest &request,
+                            CatalogLoadTableResult *result);
+
+  CatalogStatus LoadTable(const CatalogTableIdent &ident,
+                          CatalogLoadTableResult *result);
+
+  //optimistic concurrency is via the requirements array inside
+  //commit_request_json (assert-table-uuid / assert-ref-snapshot-id),
+  //not an http header -- that's the iceberg rest spec's primary
+  //mechanism and what ayush's fork uses. a lost race comes back as
+  //CatalogStatusCode::kConflict.
+  CatalogStatus CommitTable(const CatalogCommitRequest &request,
                             CatalogLoadTableResult *result);
 
   CatalogStatus TableExists(const CatalogTableIdent &ident, bool *exists);
