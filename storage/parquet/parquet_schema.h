@@ -50,6 +50,11 @@ bool AppendMariaDBFieldToDuckDBAppender(Field *field, duckdb::Appender *appender
 bool StoreDuckDBValueInMariaDBField(Field *field, const duckdb::Value &value,
                                     std::string *error);
 
+//builds the iceberg "struct" schema json for a CreateTable request, e.g.
+//{"type":"struct","schema-id":0,"fields":[{"id":1,"name":"id",...}]}.
+bool BuildIcebergSchemaJson(TABLE *table, int schema_id, std::string *schema_json,
+                           std::string *error);
+
 } // namespace parquet
 
 #endif

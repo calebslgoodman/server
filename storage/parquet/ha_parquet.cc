@@ -6,6 +6,7 @@
 #include "log.h"
 #include "parquet_schema.h"
 #include "parquet_object_store.h"
+#include "parquet_catalog.h"
 
 #include <sys/stat.h>
 #include <chrono>
@@ -41,6 +42,83 @@ static char *parquet_s3_access_key;
 static char *parquet_s3_secret_key;
 static unsigned long parquet_write_buffer_max_rows;
 static unsigned long parquet_write_buffer_flush_interval_ms;
+
+//empty base uri (the default) disables iceberg registration entirely,
+//same "off unless configured" pattern as the s3 sysvars above.
+static char *parquet_catalog_base_uri;
+static char *parquet_catalog_warehouse;
+
+//splits a mariadb table path like ".../testdb/t1" into ("testdb", "t1").
+static bool SplitTableIdent(const std::string &name, std::string *db, std::string *table)
+{
+  size_t last_slash= name.find_last_of('/');
+  if (last_slash == std::string::npos || last_slash == 0)
+    return false;
+  *table= name.substr(last_slash + 1);
+  size_t second_last= name.find_last_of('/', last_slash - 1);
+  *db= second_last == std::string::npos
+          ? name.substr(0, last_slash)
+          : name.substr(second_last + 1, last_slash - second_last - 1);
+  return !db->empty() && !table->empty();
+}
+
+//registers name as a real iceberg table in the rest catalog (lakekeeper),
+//so a real snapshot-bearing table exists there, not just something we
+//track in our own in-process maps. no-op if no catalog is configured.
+static bool RegisterTableWithCatalog(const std::string &name, TABLE *table_arg,
+                                     std::string *error)
+{
+  if (parquet_catalog_base_uri[0] == '\0' || parquet_catalog_warehouse[0] == '\0')
+    return true;
+
+  std::string db_name, table_ident;
+  if (!SplitTableIdent(name, &db_name, &table_ident))
+  {
+    *error= "could not derive a namespace/table name from '" + name + "'";
+    return false;
+  }
+
+  parquet::CatalogClientConfig cat_config;
+  cat_config.base_uri= parquet_catalog_base_uri;
+  cat_config.warehouse= parquet_catalog_warehouse;
+  parquet::ParquetCatalogClient catalog(cat_config);
+
+  parquet::CatalogStatus status= catalog.BootstrapConfig();
+  if (!status.ok())
+  {
+    *error= "catalog bootstrap failed: " + status.message;
+    return false;
+  }
+
+  parquet::CatalogNamespaceIdent ns;
+  ns.parts= {db_name};
+  status= catalog.EnsureNamespace(ns);
+  if (!status.ok())
+  {
+    *error= "EnsureNamespace failed: " + status.message;
+    return false;
+  }
+
+  std::string schema_json;
+  if (!parquet::BuildIcebergSchemaJson(table_arg, 0, &schema_json, error))
+    return false;
+
+  parquet::CatalogCreateTableRequest request;
+  request.ident.namespace_ident= ns;
+  request.ident.table_name= table_ident;
+  request.schema_json= schema_json;
+  parquet::CatalogLoadTableResult result;
+  status= catalog.CreateTable(request, &result);
+  //a stale catalog entry from an earlier drop/recreate cycle (day 7 doesn't
+  //clean up the catalog on DROP TABLE yet) shouldn't block re-creating the
+  //mariadb-side table.
+  if (!status.ok() && status.code != parquet::CatalogStatusCode::kConflict)
+  {
+    *error= "CreateTable failed: " + status.message;
+    return false;
+  }
+  return true;
+}
 
 //per-thd "mailbox" (see extra_docs/MariaDB System Design.docx) tracking
 //which tables this statement/transaction wrote to, so the handlerton
@@ -248,6 +326,17 @@ int ha_parquet::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *creat
   }
   catch (const std::exception &e)
   {
+    return HA_ERR_INTERNAL_ERROR;
+  }
+
+  //register a real iceberg table with the rest catalog, if one is
+  //configured -- day 7. unlike the s3 upload step, this failing means
+  //CREATE TABLE fails: the whole point of today is that the table
+  //genuinely exists in the catalog, not just in our own bookkeeping.
+  if (!RegisterTableWithCatalog(name, table_arg, &error))
+  {
+    sql_print_warning("parquet: iceberg catalog registration failed for %s: %s",
+                      name, error.c_str());
     return HA_ERR_INTERNAL_ERROR;
   }
 
@@ -484,6 +573,17 @@ static MYSQL_SYSVAR_ULONG(write_buffer_flush_interval_ms,
   "many milliseconds, even below the row-count threshold.",
   NULL, NULL, 30000, 100, ULONG_MAX, 1);
 
+static MYSQL_SYSVAR_STR(catalog_base_uri, parquet_catalog_base_uri,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+  "Iceberg REST catalog base uri (e.g. http://127.0.0.1:8181/catalog for "
+  "a local lakekeeper). Empty disables iceberg registration.",
+  NULL, NULL, "");
+
+static MYSQL_SYSVAR_STR(catalog_warehouse, parquet_catalog_warehouse,
+  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+  "Name of the warehouse to register tables under in the rest catalog.",
+  NULL, NULL, "");
+
 static struct st_mysql_sys_var *parquet_system_variables[]=
 {
   MYSQL_SYSVAR(s3_endpoint),
@@ -493,6 +593,8 @@ static struct st_mysql_sys_var *parquet_system_variables[]=
   MYSQL_SYSVAR(s3_secret_key),
   MYSQL_SYSVAR(write_buffer_max_rows),
   MYSQL_SYSVAR(write_buffer_flush_interval_ms),
+  MYSQL_SYSVAR(catalog_base_uri),
+  MYSQL_SYSVAR(catalog_warehouse),
   NULL
 };
 

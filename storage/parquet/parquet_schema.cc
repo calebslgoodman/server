@@ -2,6 +2,8 @@
 #include "field.h"
 #include "table.h"
 
+#include "json.hpp"
+
 namespace parquet
 {
 
@@ -173,6 +175,56 @@ bool StoreDuckDBValueInMariaDBField(Field *field, const duckdb::Value &value,
       *error= "unsupported column type in rnd_next";
       return false;
   }
+}
+
+static bool MariaDBFieldToIcebergType(Field *field, std::string *iceberg_type,
+                                      std::string *error)
+{
+  switch (field->type())
+  {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+      *iceberg_type= "long";
+      return true;
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE:
+      *iceberg_type= "double";
+      return true;
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_STRING:
+      *iceberg_type= "string";
+      return true;
+    default:
+      *error= std::string("unsupported column type for field '") +
+              field->field_name.str + "'";
+      return false;
+  }
+}
+
+bool BuildIcebergSchemaJson(TABLE *table, int schema_id, std::string *schema_json,
+                           std::string *error)
+{
+  nlohmann::json fields= nlohmann::json::array();
+  int field_id= 1;
+  for (Field **field= table->field; *field; field++, field_id++)
+  {
+    std::string iceberg_type;
+    if (!MariaDBFieldToIcebergType(*field, &iceberg_type, error))
+      return false;
+    fields.push_back({{"id", field_id},
+                      {"name", (*field)->field_name.str},
+                      {"required", ((*field)->flags & NOT_NULL_FLAG) != 0},
+                      {"type", iceberg_type}});
+  }
+
+  nlohmann::json schema= {
+      {"type", "struct"}, {"schema-id", schema_id}, {"fields", fields}};
+  *schema_json= schema.dump();
+  return true;
 }
 
 } // namespace parquet
