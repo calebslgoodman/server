@@ -233,6 +233,61 @@ static bool CommitFlushedFileToIceberg(const std::string &table_name,
   return true;
 }
 
+//day 10: resolves table_name's actual data file list purely by reading
+//iceberg's own metadata -- LoadTable for the current snapshot's
+//manifest-list location, download + decode that (avro), download +
+//decode every manifest it points at (avro) -- and logs it, entirely
+//independent of our own parquet_files bookkeeping. reads still go
+//through parquet_files for now; wiring this into rnd_init is day 11.
+static void LogActiveFilesFromIceberg(const std::string &table_name)
+{
+  std::string db_name, table_ident;
+  if (!SplitTableIdent(table_name, &db_name, &table_ident))
+    return;
+
+  parquet::CatalogClientConfig cat_config;
+  cat_config.base_uri= parquet_catalog_base_uri;
+  cat_config.warehouse= parquet_catalog_warehouse;
+  parquet::ParquetCatalogClient catalog(cat_config);
+
+  parquet::CatalogStatus status= catalog.BootstrapConfig();
+  if (!status.ok())
+  {
+    sql_print_warning("parquet: iceberg bootstrap for %s failed: %s",
+                      table_name.c_str(), status.message.c_str());
+    return;
+  }
+
+  parquet::CatalogTableIdent ident;
+  ident.namespace_ident.parts= {db_name};
+  ident.table_name= table_ident;
+  parquet::CatalogLoadTableResult load_result;
+  status= catalog.LoadTable(ident, &load_result);
+  if (!status.ok())
+  {
+    sql_print_warning("parquet: iceberg LoadTable for %s failed: %s",
+                      table_name.c_str(), status.message.c_str());
+    return;
+  }
+
+  std::vector<parquet::CatalogDataFile> files;
+  std::string error;
+  if (!parquet::ResolveActiveDataFilesFromIceberg(load_result, CurrentS3Config(),
+                                                  ParquetFileDir(table_name), &files,
+                                                  &error))
+  {
+    sql_print_warning("parquet: resolving %s's files from iceberg failed: %s",
+                      table_name.c_str(), error.c_str());
+    return;
+  }
+
+  std::string file_list;
+  for (const auto &f : files)
+    file_list+= (file_list.empty() ? "" : ", ") + f.path;
+  sql_print_information("parquet: %s has %zu active file(s) per iceberg: %s",
+                        table_name.c_str(), files.size(), file_list.c_str());
+}
+
 //flushes table_name's write buffer to a new local parquet file (and
 //uploads it to s3, if configured) if it has crossed the row-count or
 //staleness threshold. no-op otherwise. called from parquet_commit once
@@ -408,6 +463,11 @@ int ha_parquet::open(const char *name, int mode, uint test_if_locked)
   thr_lock_data_init(&parquet_lock, &lock, NULL);
   duckdb_table_name= name;
   con.reset(new duckdb::Connection(*parquet_db));
+
+  if (parquet_catalog_base_uri[0] != '\0' && parquet_catalog_warehouse[0] != '\0' &&
+      CurrentS3Config().enabled())
+    LogActiveFilesFromIceberg(name);
+
   return 0;
 }
 

@@ -24,6 +24,16 @@ struct ObjectStoreConfig
 bool UploadFileToS3(const std::string &local_path, const std::string &key,
                     const ObjectStoreConfig &config, std::string *error);
 
+//downloads <endpoint>/<bucket>/<key> to a local file, same signing.
+bool DownloadFileFromS3(const std::string &key, const std::string &local_path,
+                        const ObjectStoreConfig &config, std::string *error);
+
+//key accepts either a bare object key or a full "s3://bucket/key" uri
+//(iceberg metadata always stores the latter) -- strips the bucket/
+//scheme back off before downloading, since our signer just wants a key.
+bool DownloadFileFromS3Uri(const std::string &uri, const std::string &local_path,
+                           const ObjectStoreConfig &config, std::string *error);
+
 } // namespace parquet
 
 #endif

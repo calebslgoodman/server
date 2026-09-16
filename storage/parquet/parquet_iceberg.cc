@@ -86,6 +86,117 @@ void WriteLongUnion(std::string *out, uint64_t value)
   WriteLong(out, (int64_t)value);
 }
 
+//---- avro binary decoding, the mirror of the writers above. ported
+//---- from (and cross-checked against) the independent python decoder
+//---- written to verify day 8's writer -- see that day's commit message.
+
+int64_t ReadLong(const std::string &data, size_t *pos)
+{
+  uint64_t result= 0;
+  int shift= 0;
+  while (true)
+  {
+    uint8_t b= (uint8_t)data[(*pos)++];
+    result|= (uint64_t)(b & 0x7F) << shift;
+    if (!(b & 0x80))
+      break;
+    shift+= 7;
+  }
+  return (int64_t)(result >> 1) ^ -(int64_t)(result & 1);
+}
+
+int32_t ReadInt(const std::string &data, size_t *pos) { return (int32_t)ReadLong(data, pos); }
+
+std::string ReadString(const std::string &data, size_t *pos)
+{
+  int64_t n= ReadLong(data, pos);
+  std::string s= data.substr(*pos, (size_t)n);
+  *pos+= (size_t)n;
+  return s;
+}
+
+//[null, long] union: branch 0 means the value is absent.
+bool ReadLongUnion(const std::string &data, size_t *pos, uint64_t *value)
+{
+  int64_t branch= ReadLong(data, pos);
+  if (branch == 0)
+    return false;
+  *value= (uint64_t)ReadLong(data, pos);
+  return true;
+}
+
+struct DecodedObjectContainer
+{
+  std::string records; //every block's record bytes, concatenated
+  int64_t total_objects= 0;
+};
+
+//validates the OCF header (magic, codec must be "null" -- the only one
+//we ever write) and concatenates every block's records. doesn't need
+//the embedded avro.schema back out since the caller already knows
+//exactly which fixed schema it's decoding.
+bool ReadAvroObjectContainerFile(const std::string &local_path,
+                                 DecodedObjectContainer *container, std::string *error)
+{
+  std::ifstream stream(local_path, std::ios::binary);
+  if (!stream)
+  {
+    *error= "could not open " + local_path + " for reading";
+    return false;
+  }
+  std::ostringstream buf;
+  buf << stream.rdbuf();
+  std::string data= buf.str();
+
+  if (data.size() < 4 || data.compare(0, 4, "Obj\x01", 4) != 0)
+  {
+    *error= local_path + " is not a valid avro object container file";
+    return false;
+  }
+  size_t pos= 4;
+
+  std::string codec= "null";
+  int64_t n= ReadLong(data, &pos);
+  while (n != 0)
+  {
+    for (int64_t i= 0; i < n; i++)
+    {
+      std::string key= ReadString(data, &pos);
+      std::string value= ReadString(data, &pos);
+      if (key == "avro.codec")
+        codec= value;
+    }
+    n= ReadLong(data, &pos);
+  }
+  if (codec != "null")
+  {
+    *error= local_path + " uses avro codec '" + codec + "', only 'null' is supported";
+    return false;
+  }
+
+  std::string sync_marker= data.substr(pos, 16);
+  pos+= 16;
+
+  container->records.clear();
+  container->total_objects= 0;
+  while (pos + 16 < data.size())
+  {
+    int64_t object_count= ReadLong(data, &pos);
+    int64_t byte_length= ReadLong(data, &pos);
+    container->records.append(data, pos, (size_t)byte_length);
+    pos+= (size_t)byte_length;
+    container->total_objects+= object_count;
+
+    if (data.compare(pos, 16, sync_marker) != 0)
+    {
+      *error= local_path + " has a sync marker mismatch mid-file";
+      return false;
+    }
+    pos+= 16;
+  }
+  return true;
+}
+
 //writes a single-block, uncompressed avro object container file -- the
 //standard avro OCF layout ("Obj\x01" magic, header with embedded
 //schema, sync marker, one block of records, sync marker again) with
@@ -412,6 +523,118 @@ bool BuildIcebergCommitArtifacts(const CatalogTableIdent &ident,
   artifacts->sequence_number= sequence_number;
   artifacts->commit_request_json=
       json({{"requirements", requirements}, {"updates", updates}}).dump();
+  return true;
+}
+
+bool DecodeManifestListFile(const std::string &local_path,
+                            std::vector<std::string> *manifest_paths, std::string *error)
+{
+  DecodedObjectContainer container;
+  if (!ReadAvroObjectContainerFile(local_path, &container, error))
+    return false;
+
+  size_t pos= 0;
+  manifest_paths->clear();
+  for (int64_t i= 0; i < container.total_objects; i++)
+  {
+    std::string manifest_path= ReadString(container.records, &pos);
+    ReadLong(container.records, &pos); //manifest_length
+    ReadInt(container.records, &pos);  //partition_spec_id
+    ReadLong(container.records, &pos); //added_snapshot_id
+    ReadInt(container.records, &pos);  //added_files_count
+    ReadInt(container.records, &pos);  //existing_files_count
+    ReadInt(container.records, &pos);  //deleted_files_count
+    ReadLong(container.records, &pos); //added_rows_count
+    ReadLong(container.records, &pos); //existing_rows_count
+    ReadLong(container.records, &pos); //deleted_rows_count
+    ReadLong(container.records, &pos); //sequence_number
+    ReadLong(container.records, &pos); //min_sequence_number
+    ReadInt(container.records, &pos);  //content
+    manifest_paths->push_back(manifest_path);
+  }
+  return true;
+}
+
+bool DecodeManifestFile(const std::string &local_path,
+                        std::vector<CatalogDataFile> *data_files, std::string *error)
+{
+  DecodedObjectContainer container;
+  if (!ReadAvroObjectContainerFile(local_path, &container, error))
+    return false;
+
+  size_t pos= 0;
+  data_files->clear();
+  for (int64_t i= 0; i < container.total_objects; i++)
+  {
+    int32_t status= ReadInt(container.records, &pos);
+    uint64_t snapshot_id= 0, sequence_number= 0, file_sequence_number= 0;
+    ReadLongUnion(container.records, &pos, &snapshot_id);
+    ReadLongUnion(container.records, &pos, &sequence_number);
+    ReadLongUnion(container.records, &pos, &file_sequence_number);
+    ReadInt(container.records, &pos);           //data_file.content
+    std::string file_path= ReadString(container.records, &pos);
+    ReadString(container.records, &pos);         //file_format
+    //partition_data has zero fields -- nothing to read (see day 8 fix)
+    int64_t record_count= ReadLong(container.records, &pos);
+    int64_t file_size_bytes= ReadLong(container.records, &pos);
+
+    if (status == 2) //deleted -- not currently live
+      continue;
+
+    CatalogDataFile file;
+    file.path= file_path;
+    file.record_count= (uint64_t)record_count;
+    file.file_size_bytes= (uint64_t)file_size_bytes;
+    file.added_in_snapshot_id= snapshot_id;
+    file.added_in_sequence_number= sequence_number;
+    data_files->push_back(file);
+  }
+  return true;
+}
+
+namespace
+{
+
+std::string BaseName(const std::string &path)
+{
+  size_t slash= path.find_last_of('/');
+  return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+} // namespace
+
+bool ResolveActiveDataFilesFromIceberg(const CatalogLoadTableResult &load_result,
+                                       const ObjectStoreConfig &s3_config,
+                                       const std::string &local_dir,
+                                       std::vector<CatalogDataFile> *data_files,
+                                       std::string *error)
+{
+  data_files->clear();
+  if (load_result.current_snapshot_manifest_list.empty())
+    return true; //no commits yet -- an empty table, not an error
+
+  std::string manifest_list_local=
+      local_dir + "/downloaded_" + BaseName(load_result.current_snapshot_manifest_list);
+  if (!DownloadFileFromS3Uri(load_result.current_snapshot_manifest_list,
+                             manifest_list_local, s3_config, error))
+    return false;
+
+  std::vector<std::string> manifest_uris;
+  if (!DecodeManifestListFile(manifest_list_local, &manifest_uris, error))
+    return false;
+
+  for (const auto &manifest_uri : manifest_uris)
+  {
+    std::string manifest_local= local_dir + "/downloaded_" + BaseName(manifest_uri);
+    if (!DownloadFileFromS3Uri(manifest_uri, manifest_local, s3_config, error))
+      return false;
+
+    std::vector<CatalogDataFile> files_in_manifest;
+    if (!DecodeManifestFile(manifest_local, &files_in_manifest, error))
+      return false;
+    data_files->insert(data_files->end(), files_in_manifest.begin(),
+                       files_in_manifest.end());
+  }
   return true;
 }
 

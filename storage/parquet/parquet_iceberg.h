@@ -2,6 +2,7 @@
 #define PARQUET_ICEBERG_INCLUDED
 
 #include "parquet_catalog.h"
+#include "parquet_object_store.h"
 
 #include <cstdint>
 #include <string>
@@ -42,6 +43,36 @@ bool BuildIcebergCommitArtifacts(const CatalogTableIdent &ident,
                                  const std::string &local_dir,
                                  IcebergCommitArtifacts *artifacts,
                                  std::string *error);
+
+//reads a local manifest-list avro file (already downloaded from s3) and
+//returns the s3:// path of every manifest file it points at. lakekeeper
+//reports "scan-planning-mode":"client" -- it does not resolve manifests
+//for us, so this is real, unavoidable work, not a shortcut we're
+//choosing not to take.
+bool DecodeManifestListFile(const std::string &local_path,
+                            std::vector<std::string> *manifest_paths,
+                            std::string *error);
+
+//reads a local manifest avro file (already downloaded from s3) and
+//returns every currently-live data file it lists (status 0 "existing"
+//or 1 "added" -- excludes status 2 "deleted", though we don't produce
+//those yet).
+bool DecodeManifestFile(const std::string &local_path,
+                        std::vector<CatalogDataFile> *data_files, std::string *error);
+
+//the full read-side pipeline: downloads the current snapshot's
+//manifest-list from s3, decodes it, downloads and decodes every
+//manifest it points at, and returns the union of every currently-live
+//data file -- purely from iceberg's own metadata, independent of our
+//in-process parquet_files map. an empty load_result.current_snapshot_id
+//(no commits yet) returns an empty list, not an error. downloaded avro
+//files land in local_dir alongside everything else this table already
+//keeps there.
+bool ResolveActiveDataFilesFromIceberg(const CatalogLoadTableResult &load_result,
+                                       const ObjectStoreConfig &s3_config,
+                                       const std::string &local_dir,
+                                       std::vector<CatalogDataFile> *data_files,
+                                       std::string *error);
 
 } // namespace parquet
 
