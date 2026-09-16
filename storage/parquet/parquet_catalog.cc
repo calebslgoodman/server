@@ -103,8 +103,26 @@ bool ParseLoadTableResult(const std::string &body, CatalogLoadTableResult *resul
   //fresh tables have no snapshot at all yet -- stays empty in that case.
   if (metadata.contains("current-snapshot-id") &&
       !metadata["current-snapshot-id"].is_null())
+  {
     result->current_snapshot_id=
         std::to_string(metadata["current-snapshot-id"].get<int64_t>());
+
+    //day 9: find that snapshot's own entry in the snapshots array and
+    //pull out where its manifest-list lives. still just json parsing --
+    //the manifest-list file itself is binary avro (day 10).
+    if (metadata.contains("snapshots") && metadata["snapshots"].is_array())
+    {
+      for (const auto &snapshot : metadata["snapshots"])
+      {
+        if (std::to_string(snapshot.value("snapshot-id", (int64_t)0)) ==
+            result->current_snapshot_id)
+        {
+          result->current_snapshot_manifest_list= snapshot.value("manifest-list", "");
+          break;
+        }
+      }
+    }
+  }
   return true;
 }
 

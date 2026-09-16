@@ -65,6 +65,10 @@ struct CatalogLoadTableResult
   std::string current_snapshot_id; //empty if the table has no snapshot yet
   int current_schema_id= 0;
   uint64_t last_sequence_number= 0;
+  //the s3:// location of current_snapshot_id's manifest-list -- day 9's
+  //actual goal. still json at this level; the manifest-list file itself
+  //is binary avro (day 10).
+  std::string current_snapshot_manifest_list;
 };
 
 //one already-committed data file this table's current snapshot points

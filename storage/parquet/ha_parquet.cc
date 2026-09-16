@@ -219,6 +219,15 @@ static bool CommitFlushedFileToIceberg(const std::string &table_name,
     return false;
   }
 
+  //day 9: prove we can read the committed snapshot's manifest-list
+  //location back out of the table metadata json lakekeeper just
+  //returned, independent of the local path we already know we just
+  //uploaded it to.
+  sql_print_information(
+      "parquet: %s committed snapshot %s, manifest-list at %s",
+      table_name.c_str(), commit_result.current_snapshot_id.c_str(),
+      commit_result.current_snapshot_manifest_list.c_str());
+
   new_file->added_in_snapshot_id= artifacts.snapshot_id;
   new_file->added_in_sequence_number= artifacts.sequence_number;
   return true;
